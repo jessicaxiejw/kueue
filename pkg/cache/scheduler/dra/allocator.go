@@ -19,8 +19,10 @@ package dra
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -56,24 +58,52 @@ func (c *CELCache) get() *dracel.Cache {
 	return c.value
 }
 
-// lazyAllocator builds the snapshot's allocator on first use. A Pod's claims go to
-// Allocate rather than the constructor, so one allocator serves the whole snapshot
-// and the device state cannot shift mid-cycle.
-type lazyAllocator struct {
-	build func(context.Context) (structured.Allocator, error)
+// lazyDevices builds the snapshot's device state on first use. A Pod's claims go to
+// Allocate rather than the constructor, so one state serves the whole snapshot and
+// cannot shift mid-cycle.
+type lazyDevices struct {
+	build func(context.Context) (*deviceState, error)
 	once  sync.Once
-	value structured.Allocator
+	value *deviceState
 	err   error
 }
 
-func (l *lazyAllocator) get(ctx context.Context) (structured.Allocator, error) {
+func (l *lazyDevices) get(ctx context.Context) (*deviceState, error) {
 	l.once.Do(func() {
 		l.value, l.err = l.build(ctx)
 	})
 	return l.value, l.err
 }
 
-func (c *Checker) buildAllocator(ctx context.Context) (structured.Allocator, error) {
+// deviceState is the cluster's devices as the snapshot read them.
+type deviceState struct {
+	// allocator answers whether one Pod's claims fit on any node.
+	allocator structured.Allocator
+
+	// The rest builds an allocator for one node that also counts the devices of the
+	// Pods already placed there. Scoping it to the node's pools keeps that cheap.
+	features    structured.Features
+	classLister *deviceClassCache
+	celCache    *dracel.Cache
+	pools       map[poolKey]*poolDevices
+	// nodePools are the pools with a slice bound to each node, and sharedPools the
+	// ones with a slice bound to none, which may serve any node.
+	nodePools   map[string][]poolKey
+	sharedPools []poolKey
+}
+
+type poolKey struct {
+	driver string
+	pool   string
+}
+
+// poolDevices is a pool's slices and the devices allocated from it.
+type poolDevices struct {
+	slices    []*resourceapi.ResourceSlice
+	allocated []resourceapi.DeviceRequestAllocationResult
+}
+
+func (c *Checker) buildDevices(ctx context.Context) (*deviceState, error) {
 	var sliceList resourceapi.ResourceSliceList
 	if err := c.cl.List(ctx, &sliceList); err != nil {
 		return nil, fmt.Errorf("listing ResourceSlices: %w", err)
@@ -94,9 +124,7 @@ func (c *Checker) buildAllocator(ctx context.Context) (structured.Allocator, err
 	draFeatures := dynamicresources.AllocatorFeatures(schedulerfeature.NewSchedulerFeaturesFromGates(utilfeature.DefaultFeatureGate))
 	draFeatures.DeviceTaints = draFeatures.DeviceTaints && features.Enabled(features.KueueDRAIntegrationDeviceTaints)
 
-	// The allocated state is read with the allocator's own setting rather than the gate, so
-	// the two cannot disagree on whether a shared device is partly or wholly consumed.
-	allocatedState, err := buildAllocatedState(ctx, c.cl, draFeatures.ConsumableCapacity)
+	allocated, err := listAllocatedDevices(ctx, c.cl)
 	if err != nil {
 		return nil, fmt.Errorf("building allocated device state: %w", err)
 	}
@@ -106,50 +134,129 @@ func (c *Checker) buildAllocator(ctx context.Context) (structured.Allocator, err
 		return nil, fmt.Errorf("listing DeviceClasses: %w", err)
 	}
 
-	allocator, err := structured.NewAllocator(ctx, draFeatures, allocatedState, classLister, deviceSlices, c.celCache.get())
+	state := &deviceState{
+		features:    draFeatures,
+		classLister: classLister,
+		celCache:    c.celCache.get(),
+	}
+	state.allocator, err = state.newAllocator(ctx, deviceSlices, allocated)
+	if err != nil {
+		return nil, err
+	}
+	state.indexPools(deviceSlices, allocated)
+	return state, nil
+}
+
+func (d *deviceState) newAllocator(ctx context.Context, slices []*resourceapi.ResourceSlice, allocated []resourceapi.DeviceRequestAllocationResult) (structured.Allocator, error) {
+	// The allocated state is read with the allocator's own setting rather than the gate, so
+	// the two cannot disagree on whether a shared device is partly or wholly consumed.
+	allocatedState := newAllocatedState(allocated, d.features.ConsumableCapacity)
+	allocator, err := structured.NewAllocator(ctx, d.features, allocatedState, d.classLister, slices, d.celCache)
 	if err != nil {
 		return nil, fmt.Errorf("creating DRA allocator: %w", err)
 	}
 	return allocator, nil
 }
 
-func buildAllocatedState(ctx context.Context, cl client.Client, consumableCapacity bool) (structured.AllocatedState, error) {
-	allocatedDevices := sets.New[structured.DeviceID]()
-	allocatedSharedDeviceIDs := sets.New[structured.SharedDeviceID]()
-	aggregatedCapacity := structured.NewConsumedCapacityCollection()
+func (d *deviceState) indexPools(deviceSlices []*resourceapi.ResourceSlice, allocated []resourceapi.DeviceRequestAllocationResult) {
+	d.pools = make(map[poolKey]*poolDevices)
+	d.nodePools = make(map[string][]poolKey)
+	shared := sets.New[poolKey]()
+	for _, slice := range deviceSlices {
+		key := poolKey{driver: slice.Spec.Driver, pool: slice.Spec.Pool.Name}
+		pool, found := d.pools[key]
+		if !found {
+			pool = &poolDevices{}
+			d.pools[key] = pool
+		}
+		pool.slices = append(pool.slices, slice)
+		nodeName := ptr.Deref(slice.Spec.NodeName, "")
+		switch {
+		case nodeName == "":
+			if !shared.Has(key) {
+				shared.Insert(key)
+				d.sharedPools = append(d.sharedPools, key)
+			}
+		case !slices.Contains(d.nodePools[nodeName], key):
+			d.nodePools[nodeName] = append(d.nodePools[nodeName], key)
+		}
+	}
+	for _, result := range allocated {
+		// A device in no pool cannot be allocated again, so it bounds nothing.
+		if pool, found := d.pools[poolKey{driver: result.Driver, pool: result.Pool}]; found {
+			pool.allocated = append(pool.allocated, result)
+		}
+	}
+}
+
+// devicesForNode is every pool that can serve node, whole so that none looks
+// incomplete, and the devices already allocated from them.
+func (d *deviceState) devicesForNode(node *corev1.Node) ([]*resourceapi.ResourceSlice, []resourceapi.DeviceRequestAllocationResult) {
+	var nodeSlices []*resourceapi.ResourceSlice
+	var allocated []resourceapi.DeviceRequestAllocationResult
+	seen := sets.New[poolKey]()
+	for _, key := range slices.Concat(d.nodePools[node.Name], d.sharedPools) {
+		if seen.Has(key) {
+			continue
+		}
+		seen.Insert(key)
+		pool := d.pools[key]
+		nodeSlices = append(nodeSlices, pool.slices...)
+		allocated = append(allocated, pool.allocated...)
+	}
+	return nodeSlices, allocated
+}
+
+// listAllocatedDevices returns the devices the cluster's ResourceClaims hold. Admin
+// access leaves a device free for others, so those results are left out.
+func listAllocatedDevices(ctx context.Context, cl client.Client) ([]resourceapi.DeviceRequestAllocationResult, error) {
 	var claims resourceapi.ResourceClaimList
 	if err := cl.List(ctx, &claims); err != nil {
-		return structured.AllocatedState{}, fmt.Errorf("listing ResourceClaims: %w", err)
+		return nil, fmt.Errorf("listing ResourceClaims: %w", err)
 	}
-
+	var allocated []resourceapi.DeviceRequestAllocationResult
 	for i := range claims.Items {
 		claim := &claims.Items[i]
 		if claim.Status.Allocation == nil {
 			continue
 		}
-		for _, result := range claim.Status.Allocation.Devices.Results {
-			if ptr.Deref(result.AdminAccess, false) {
-				continue
-			}
-			deviceID := structured.MakeDeviceID(result.Driver, result.Pool, result.Device)
-			if consumableCapacity && result.ShareID != nil {
-				sharedID := structured.MakeSharedDeviceID(deviceID, result.ShareID)
-				allocatedSharedDeviceIDs.Insert(sharedID)
-				if result.ConsumedCapacity != nil {
-					cc := structured.NewDeviceConsumedCapacity(deviceID, result.ConsumedCapacity)
-					aggregatedCapacity.Insert(cc)
-				}
-				continue
-			}
-			allocatedDevices.Insert(deviceID)
+		allocated = appendHeldDevices(allocated, claim.Status.Allocation.Devices.Results)
+	}
+	return allocated, nil
+}
+
+// appendHeldDevices appends the results that keep their device from other claims.
+func appendHeldDevices(held []resourceapi.DeviceRequestAllocationResult, results []resourceapi.DeviceRequestAllocationResult) []resourceapi.DeviceRequestAllocationResult {
+	for _, result := range results {
+		if !ptr.Deref(result.AdminAccess, false) {
+			held = append(held, result)
 		}
 	}
+	return held
+}
 
+func newAllocatedState(allocated []resourceapi.DeviceRequestAllocationResult, consumableCapacity bool) structured.AllocatedState {
+	allocatedDevices := sets.New[structured.DeviceID]()
+	allocatedSharedDeviceIDs := sets.New[structured.SharedDeviceID]()
+	aggregatedCapacity := structured.NewConsumedCapacityCollection()
+	for _, result := range allocated {
+		deviceID := structured.MakeDeviceID(result.Driver, result.Pool, result.Device)
+		if consumableCapacity && result.ShareID != nil {
+			sharedID := structured.MakeSharedDeviceID(deviceID, result.ShareID)
+			allocatedSharedDeviceIDs.Insert(sharedID)
+			if result.ConsumedCapacity != nil {
+				cc := structured.NewDeviceConsumedCapacity(deviceID, result.ConsumedCapacity)
+				aggregatedCapacity.Insert(cc)
+			}
+			continue
+		}
+		allocatedDevices.Insert(deviceID)
+	}
 	return structured.AllocatedState{
 		AllocatedDevices:         allocatedDevices,
 		AllocatedSharedDeviceIDs: allocatedSharedDeviceIDs,
 		AggregatedCapacity:       aggregatedCapacity,
-	}, nil
+	}
 }
 
 // deviceClassCache serves the DeviceClasses read when the allocator was built. The

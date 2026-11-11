@@ -133,6 +133,67 @@ func TestScheduleForTASDRA(t *testing.T) {
 				features.TASNodeFeasibilityForAllLevels: true,
 			},
 		},
+		"two Pods each claiming a node's only device: admitted one per node": {
+			// CPU fits both Pods on x1, which sorts first, but its one device holds one.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("2"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("2"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{topology},
+			resourceFlavors: []kueue.ResourceFlavor{tasFlavor},
+			clusterQueues:   []kueue.ClusterQueue{clusterQueue},
+			objects:         devices,
+			draResources:    draResources,
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("wl", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("main", 2).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						ResourceClaimTemplate("gpu", "gpu-template").
+						Obj()).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/wl": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("main").
+						Assignment(corev1.ResourceCPU, "tas-default", "2").
+						Assignment("example.com/gpu", "tas-default", "2").
+						Count(2).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&topology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "wl", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "wl", "Admitted", corev1.EventTypeNormal).Obj(),
+			},
+			featureGates: map[featuregate.Feature]bool{
+				features.KueueDRAIntegration:            true,
+				features.KueueDRADeviceFeasibility:      true,
+				features.TASNodeFeasibilityForAllLevels: true,
+			},
+		},
 		"a DeviceTaintRule on the first node's devices: admitted onto the second": {
 			nodes:           nodes,
 			topologies:      []kueue.Topology{topology},

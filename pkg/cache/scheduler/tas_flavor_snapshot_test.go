@@ -3738,3 +3738,79 @@ func TestTASAssignmentsResultFailure(t *testing.T) {
 		})
 	}
 }
+
+// recordingDeviceCounter answers CountPodsOnNode with a fixed device capacity and
+// records each limit it was asked with.
+type recordingDeviceCounter struct {
+	capacity int32
+	limits   []int32
+}
+
+func (c *recordingDeviceCounter) CountPodsOnNode(_ context.Context, _ *corev1.Node, _, _ *simulator.PodRequirements, limit int32) (int32, error) {
+	c.limits = append(c.limits, limit)
+	return min(c.capacity, limit), nil
+}
+
+func TestDevicePodCountOnCachesSettledCounts(t *testing.T) {
+	type ask struct {
+		limit     int32
+		wantCount int32
+	}
+	matchKey := &podSetMatchKey{WorkloadUID: "uid", PodSetName: "workers"}
+	cases := map[string]struct {
+		matchKey *podSetMatchKey
+		capacity int32
+		asks     []ask
+		// forget runs forgetMatchingLeaves before the last ask.
+		forget     bool
+		wantLimits []int32
+	}{
+		"an exact count answers every later limit": {
+			matchKey:   matchKey,
+			capacity:   2,
+			asks:       []ask{{limit: 4, wantCount: 2}, {limit: 8, wantCount: 2}, {limit: 1, wantCount: 1}},
+			wantLimits: []int32{4},
+		},
+		"a count at its limit answers only smaller limits": {
+			matchKey:   matchKey,
+			capacity:   6,
+			asks:       []ask{{limit: 4, wantCount: 4}, {limit: 3, wantCount: 3}, {limit: 8, wantCount: 6}},
+			wantLimits: []int32{4, 8},
+		},
+		"without a match key nothing is cached": {
+			capacity:   2,
+			asks:       []ask{{limit: 4, wantCount: 2}, {limit: 4, wantCount: 2}},
+			wantLimits: []int32{4, 4},
+		},
+		"forgetting the matching leaves forgets the counts": {
+			matchKey:   matchKey,
+			capacity:   2,
+			asks:       []ask{{limit: 4, wantCount: 2}, {limit: 4, wantCount: 2}},
+			forget:     true,
+			wantLimits: []int32{4, 4},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := &TASFlavorSnapshot{}
+			leaf := &leafDomain{id: "x1", node: &corev1.Node{Name: "x1"}}
+			requirements := &topologyAssignmentPodRequirements{matchKey: tc.matchKey}
+			counter := &recordingDeviceCounter{capacity: tc.capacity}
+			for i, a := range tc.asks {
+				if tc.forget && i == len(tc.asks)-1 {
+					s.forgetMatchingLeaves()
+				}
+				got, err := s.devicePodCountOn(t.Context(), counter, leaf, requirements, false, a.limit)
+				if err != nil {
+					t.Fatalf("devicePodCountOn returned error: %v", err)
+				}
+				if got != a.wantCount {
+					t.Errorf("ask %d: devicePodCountOn(limit=%d) = %d, want %d", i, a.limit, got, a.wantCount)
+				}
+			}
+			if diff := cmp.Diff(tc.wantLimits, counter.limits); diff != "" {
+				t.Errorf("limits asked of the counter (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}

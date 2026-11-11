@@ -1591,6 +1591,220 @@ func TestFindTopologyAssignments(t *testing.T) {
 				},
 			}},
 		},
+		"a node's devices bound how many Pods of a DRA-backed extended resource it takes": {
+			// Neither node publishes the resource, so the request leaves it to the device
+			// check. Each node has one device: CPU alone fits both Pods on x1, which sorts
+			// first, but its device holds only one of them.
+			featureGates: map[featuregate.Feature]bool{
+				features.KueueDRAIntegrationExtendedResource: true,
+				features.KueueDRADeviceFeasibility:           true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			levels: defaultOneLevel,
+			draObjects: []client.Object{
+				testingdra.MakeDeviceClass("gpu.example.com").
+					ExtendedResourceName("example.com/gpu").
+					Obj(),
+				testingdra.MakeResourceSlice("x1-gpus", "gpu.example.com").
+					NodeName("x1").
+					Pool("x1-pool", 1, 1).
+					Device("gpu-0").
+					Obj(),
+				testingdra.MakeResourceSlice("x2-gpus", "gpu.example.com").
+					NodeName("x2").
+					Pool("x2-pool", 1, 1).
+					Device("gpu-0").
+					Obj(),
+			},
+			workload: utiltestingapi.MakeWorkload("wl", "ns").Obj(),
+			podSets: []PodSetTestCase{{
+				podSetName: "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{
+					Preferred: new(corev1.LabelHostname),
+				},
+				requests: map[corev1.ResourceName]int64{
+					corev1.ResourceCPU: 1000,
+				},
+				draBackedRequests: map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:             2,
+				containerRequests: corev1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"x1"}},
+						{Count: 1, Values: []string{"x2"}},
+					},
+				},
+			}},
+		},
+		"a node's devices bound how many Pods of a PodSet's ResourceClaims it takes": {
+			// x1 has two devices and x2 one. Each Pod's claim takes one, so x1 holds two
+			// of the three Pods though CPU alone would fit all of them there.
+			featureGates: map[featuregate.Feature]bool{
+				features.KueueDRADeviceFeasibility: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			levels: defaultOneLevel,
+			draObjects: []client.Object{
+				testingdra.MakeDeviceClass("gpu.example.com").Obj(),
+				utiltesting.MakeResourceClaimTemplate("gpu-template", "ns").
+					DeviceRequest("gpu", "gpu.example.com", 1).
+					Obj(),
+				testingdra.MakeResourceSlice("x1-gpus", "gpu.example.com").
+					NodeName("x1").
+					Pool("x1-pool", 1, 1).
+					Device("gpu-0").
+					Device("gpu-1").
+					Obj(),
+				testingdra.MakeResourceSlice("x2-gpus", "gpu.example.com").
+					NodeName("x2").
+					Pool("x2-pool", 1, 1).
+					Device("gpu-0").
+					Obj(),
+			},
+			workload: utiltestingapi.MakeWorkload("wl", "ns").Obj(),
+			podSets: []PodSetTestCase{{
+				podSetName: "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{
+					Unconstrained: new(true),
+				},
+				requests: map[corev1.ResourceName]int64{
+					corev1.ResourceCPU: 1000,
+				},
+				count: 3,
+				resourceClaims: []corev1.PodResourceClaim{{
+					Name:                      "gpu",
+					ResourceClaimTemplateName: new("gpu-template"),
+				}},
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 2, Values: []string{"x1"}},
+						{Count: 1, Values: []string{"x2"}},
+					},
+				},
+			}},
+		},
+		"a group's leader takes its node's devices before the workers do": {
+			// The leader and both workers each claim one device and must share a host.
+			// x1 has devices for two of them and x2 for all three. CPU alone fits the
+			// group on either, so landing on x2 needs the leader counted.
+			featureGates: map[featuregate.Feature]bool{
+				features.KueueDRADeviceFeasibility:  true,
+				features.TASLeaderPodSetFeasibility: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			levels: defaultOneLevel,
+			draObjects: []client.Object{
+				testingdra.MakeDeviceClass("gpu.example.com").Obj(),
+				utiltesting.MakeResourceClaimTemplate("gpu-template", "ns").
+					DeviceRequest("gpu", "gpu.example.com", 1).
+					Obj(),
+				testingdra.MakeResourceSlice("x1-gpus", "gpu.example.com").
+					NodeName("x1").
+					Pool("x1-pool", 1, 1).
+					Device("gpu-0").
+					Device("gpu-1").
+					Obj(),
+				testingdra.MakeResourceSlice("x2-gpus", "gpu.example.com").
+					NodeName("x2").
+					Pool("x2-pool", 1, 1).
+					Device("gpu-0").
+					Device("gpu-1").
+					Device("gpu-2").
+					Obj(),
+			},
+			workload: utiltestingapi.MakeWorkload("wl", "ns").Obj(),
+			podSets: []PodSetTestCase{
+				{
+					podSetName: "leader",
+					topologyRequest: &kueue.PodSetTopologyRequest{
+						Required:        new(corev1.LabelHostname),
+						PodSetGroupName: new("sameGroup"),
+					},
+					requests:        map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000},
+					podSetGroupName: new("sameGroup"),
+					count:           1,
+					resourceClaims: []corev1.PodResourceClaim{{
+						Name:                      "gpu",
+						ResourceClaimTemplateName: new("gpu-template"),
+					}},
+					wantAssignment: &tas.TopologyAssignment{
+						Levels:  defaultOneLevel,
+						Domains: []tas.TopologyDomainAssignment{{Count: 1, Values: []string{"x2"}}},
+					},
+				},
+				{
+					podSetName: "workers",
+					topologyRequest: &kueue.PodSetTopologyRequest{
+						Required:        new(corev1.LabelHostname),
+						PodSetGroupName: new("sameGroup"),
+					},
+					requests:        map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000},
+					podSetGroupName: new("sameGroup"),
+					count:           2,
+					resourceClaims: []corev1.PodResourceClaim{{
+						Name:                      "gpu",
+						ResourceClaimTemplateName: new("gpu-template"),
+					}},
+					wantAssignment: &tas.TopologyAssignment{
+						Levels:  defaultOneLevel,
+						Domains: []tas.TopologyDomainAssignment{{Count: 2, Values: []string{"x2"}}},
+					},
+				},
+			},
+		},
 		"a node advertising a DRA-backed extended resource counts it against its own capacity": {
 			// x1 publishes one device through a device plugin, x2 through a DeviceClass.
 			// x1 must take only the one Pod its allocatable covers, so the second goes to
@@ -1723,13 +1937,14 @@ func TestFindTopologyAssignments(t *testing.T) {
 		"a node advertising a DRA-backed extended resource itself passes the device check": {
 			// x1 publishes the resource through a device plugin and x2 through a
 			// DeviceClass. x1 has no ResourceSlice, so it only survives the device check
-			// because it supplies the resource from its own allocatable. x1 sorts first.
+			// because it supplies the resource from its own allocatable. Each node holds
+			// one Pod, x1 by CPU and x2 by its one device, so x1 sorts first.
 			featureGates: map[featuregate.Feature]bool{features.KueueDRAIntegrationExtendedResource: true},
 			nodes: []corev1.Node{
 				*testingnode.MakeNode("x1").
 					Label(corev1.LabelHostname, "x1").
 					StatusAllocatable(corev1.ResourceList{
-						corev1.ResourceCPU:  resource.MustParse("4"),
+						corev1.ResourceCPU:  resource.MustParse("1"),
 						corev1.ResourcePods: resource.MustParse("10"),
 						"example.com/gpu":   resource.MustParse("1"),
 					}).

@@ -231,6 +231,11 @@ type TASFlavorSnapshot struct {
 	// multiple worker PodSet placements within the same scheduling cycle snapshot.
 	matchingLeavesCache map[podSetMatchKey]*matchingLeavesCacheEntry
 
+	// devicePodCounts caches how many Pods of a PodSet each node's devices hold. The
+	// devices do not change within a snapshot, preemption included, so it is filled
+	// once per PodSet rather than on every preemption simulation.
+	devicePodCounts map[devicePodCountKey]devicePodCount
+
 	// domainTASUsage holds the TAS usage of the domains which span several
 	// leaves, i.e. only when the hostname level is virtual. A
 	// TopologyAssignment on such a topology names the domain, not the node:
@@ -293,6 +298,20 @@ type podSetMatchKey struct {
 	// Leader separates the leader's entry from the workers', which would otherwise
 	// share a key because both are built from the workers' PodSet name.
 	Leader bool
+}
+
+type devicePodCountKey struct {
+	podSetMatchKey
+	leaf utiltas.TopologyDomainID
+	// withLeader marks the count of workers placed after the group's leader.
+	withLeader bool
+}
+
+// devicePodCount is a count asked for with limit. Below limit it is exact; at limit
+// it is only a lower bound.
+type devicePodCount struct {
+	count int32
+	limit int32
 }
 
 // matchingLeavesCacheEntry stores the cached list of matching leaves and accumulated
@@ -2519,6 +2538,9 @@ func (s *TASFlavorSnapshot) fillInCounts(ctx context.Context, requirements *topo
 			leaf := s.leaves[ml.GetID()]
 			s.domainStateOf(&leaf.domain).affinityScore += ml.GetAffinityScore()
 			s.fillLeafCounts(leaf, requirements, state, cachingRemainingResourcesEnabled)
+			if err := s.boundLeafCountsByDevices(ctx, leaf, requirements); err != nil {
+				return err
+			}
 		}
 		s.fillLeaderOnlyLeafCounts(requirements, state, matchingLeaves, cachingRemainingResourcesEnabled)
 	case s.leafIsNode():
@@ -2533,6 +2555,9 @@ func (s *TASFlavorSnapshot) fillInCounts(ctx context.Context, requirements *topo
 			leaf := s.leaves[ml.GetID()]
 			s.domainStateOf(&leaf.domain).affinityScore += ml.GetAffinityScore()
 			s.fillLeafCounts(leaf, requirements, state, cachingRemainingResourcesEnabled)
+			if err := s.boundLeafCountsByDevices(ctx, leaf, requirements); err != nil {
+				return err
+			}
 		}
 		s.fillLeaderOnlyLeafCounts(requirements, state, feasibleLeaves, cachingRemainingResourcesEnabled)
 	default:
@@ -2576,10 +2601,11 @@ func (s *TASFlavorSnapshot) recordUsageDomainCaps(requirements *topologyAssignme
 	}
 }
 
-// forgetMatchingLeaves drops the cached leaf sets. The simulator's answers feed them,
-// so anything that changes what it reports has to call this.
+// forgetMatchingLeaves drops the cached leaf sets and device counts. The simulator's
+// answers feed them, so anything that changes what it reports has to call this.
 func (s *TASFlavorSnapshot) forgetMatchingLeaves() {
 	clear(s.matchingLeavesCache)
+	clear(s.devicePodCounts)
 }
 
 // podSetInfo merges a PodSet with its updates into the form the node filters read.
@@ -2852,6 +2878,74 @@ func (s *TASFlavorSnapshot) fillLeafCounts(leaf *leafDomain, requirements *topol
 	}
 
 	leafDomainState.podCountWithLeader = requirements.forLeaf(leaf).CountIn(remainingCapacity.Get())
+}
+
+// boundLeafCountsByDevices caps a leaf's Pod counts at what its node's devices hold.
+// The node passed the device check for one Pod, which says nothing about a second:
+// neither a PodSet's claims nor the devices behind a DRA-backed extended resource are
+// in the node's allocatable, so fillLeafCounts counts Pods as if they took none.
+func (s *TASFlavorSnapshot) boundLeafCountsByDevices(ctx context.Context, leaf *leafDomain, requirements *topologyAssignmentPodRequirements) error {
+	counter, ok := s.schedulerSimulator.(simulator.DevicePodCounter)
+	if !ok || leaf.node == nil {
+		return nil
+	}
+	leafState := s.domainStateOf(&leaf.domain)
+	// The device check already placed one Pod.
+	if leafState.podCount > 1 {
+		count, err := s.devicePodCountOn(ctx, counter, leaf, requirements, false, leafState.podCount)
+		if err != nil {
+			return err
+		}
+		leafState.podCount = count
+	}
+	if requirements.leader == nil || leafState.leaderCount == 0 {
+		return nil
+	}
+	// The leader leaves the workers no more devices than they have alone.
+	leafState.podCountWithLeader = min(leafState.podCountWithLeader, leafState.podCount)
+	if requirements.leader.podRequirements == nil || leafState.podCountWithLeader == 0 {
+		return nil
+	}
+	count, err := s.devicePodCountOn(ctx, counter, leaf, requirements, true, leafState.podCountWithLeader)
+	if err != nil {
+		return err
+	}
+	leafState.podCountWithLeader = count
+	return nil
+}
+
+// devicePodCountOn asks counter how many Pods, up to limit, the leaf's devices hold,
+// answering from the cache when an earlier count settles it.
+func (s *TASFlavorSnapshot) devicePodCountOn(
+	ctx context.Context,
+	counter simulator.DevicePodCounter,
+	leaf *leafDomain,
+	requirements *topologyAssignmentPodRequirements,
+	withLeader bool,
+	limit int32,
+) (int32, error) {
+	var key *devicePodCountKey
+	if requirements.matchKey != nil {
+		key = &devicePodCountKey{podSetMatchKey: *requirements.matchKey, leaf: leaf.id, withLeader: withLeader}
+		if cached, found := s.devicePodCounts[*key]; found && (cached.count < cached.limit || limit <= cached.limit) {
+			return min(cached.count, limit), nil
+		}
+	}
+	var leader *simulator.PodRequirements
+	if withLeader {
+		leader = requirements.leader.podRequirements
+	}
+	count, err := counter.CountPodsOnNode(ctx, leaf.node, &requirements.podRequirements, leader, limit)
+	if err != nil {
+		return 0, fmt.Errorf("counting Pods the devices of node %s hold: %w", leaf.node.Name, err)
+	}
+	if key != nil {
+		if s.devicePodCounts == nil {
+			s.devicePodCounts = make(map[devicePodCountKey]devicePodCount)
+		}
+		s.devicePodCounts[*key] = devicePodCount{count: count, limit: limit}
+	}
+	return count, nil
 }
 
 func (s *TASFlavorSnapshot) fillInCountsHelper(domain *domain, shape sliceShape, sliceLevelIdx int, level int, sliceSizeAtLevel map[int]int32, leaderRequired bool) {

@@ -603,7 +603,7 @@ func TestCheckerFindFeasibleNodes(t *testing.T) {
 			wantFeasible: []string{"gpu-node"},
 		},
 		// A pre-provisioned claim that is already allocated needs no second device:
-		// buildAllocatedState already counts the one it holds.
+		// listAllocatedDevices already counts the one it holds.
 		// The allocation says where it lives, so the Pod cannot go elsewhere.
 		"DRA pod with all devices allocated filters out all nodes": {
 			objects: []runtime.Object{
@@ -957,3 +957,200 @@ func TestCheckerFindFeasibleNodes(t *testing.T) {
 
 // The allocator belongs to the snapshot, not the call: repeated attempts must not
 // repeat the cluster-wide Lists it is built from.
+
+func TestCheckerCountPodsOnNode(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.KueueDRAIntegrationExtendedResource, true)
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = resourceapi.AddToScheme(scheme)
+
+	gpuNode := &corev1.Node{Name: "gpu-node"}
+	// Publishes example.com/gpu through a device plugin, so the extended resource is
+	// served from its allocatable rather than from the devices.
+	advertisingNode := &corev1.Node{
+		Name: "gpu-node",
+		Status: corev1.NodeStatus{
+			Allocatable: corev1.ResourceList{"example.com/gpu": resource.MustParse("8")},
+		},
+	}
+	gpuDeviceClass := testingdra.MakeDeviceClass("gpu.example.com").Obj()
+	gpuExtendedClass := testingdra.MakeDeviceClass("gpu-extended.example.com").
+		ExtendedResourceName("example.com/gpu").
+		Obj()
+	gpuClaimTemplate := utiltesting.MakeResourceClaimTemplate("gpu-template", "default").
+		DeviceRequest("gpu", "gpu.example.com", 1).
+		Obj()
+	gpuSlice := testingdra.MakeResourceSlice("gpu-node-slice", "gpu.example.com").
+		NodeName("gpu-node").
+		Pool("gpu-pool", 1, 1).
+		Device("gpu-0").
+		Device("gpu-1").
+		Obj()
+	otherNodeSlice := testingdra.MakeResourceSlice("other-node-slice", "gpu.example.com").
+		NodeName("other-node").
+		Pool("other-pool", 1, 1).
+		Device("gpu-0").
+		Obj()
+	// Bound to no node, so it serves every node.
+	sharedSlice := testingdra.MakeResourceSlice("shared-slice", "gpu.example.com").
+		Pool("shared-pool", 1, 1).
+		Device("gpu-0").
+		Obj()
+	sharedSlice.Spec.NodeName = nil
+	sharedSlice.Spec.AllNodes = new(true)
+	allocatedClaim := func(pool string) *resourceapi.ResourceClaim {
+		return &resourceapi.ResourceClaim{
+			Name: "existing-" + pool, Namespace: "other",
+			Status: resourceapi.ResourceClaimStatus{
+				Allocation: &resourceapi.AllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
+							{Request: "gpu", Driver: "gpu.example.com", Pool: pool, Device: "gpu-0"},
+						},
+					},
+				},
+			},
+		}
+	}
+	claimingPod := &corev1.PodTemplateSpec{
+		Namespace: "default",
+		Spec: corev1.PodSpec{
+			Containers:     []corev1.Container{{Name: "c", Image: "busybox"}},
+			ResourceClaims: []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: new("gpu-template")}},
+		},
+	}
+	extendedPod := func(count string) *corev1.PodTemplateSpec {
+		return &corev1.PodTemplateSpec{
+			Namespace: "default",
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:      "c",
+					Image:     "busybox",
+					Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"example.com/gpu": resource.MustParse(count)}},
+				}},
+			},
+		}
+	}
+	plainPod := &corev1.PodTemplateSpec{
+		Namespace: "default",
+		Spec:      corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+	}
+
+	tests := map[string]struct {
+		objects   []runtime.Object
+		node      *corev1.Node
+		workers   *corev1.PodTemplateSpec
+		leader    *corev1.PodTemplateSpec
+		limit     int32
+		wantCount int32
+	}{
+		"the devices hold fewer Pods than the limit": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     5,
+			wantCount: 2,
+		},
+		"the limit caps the count": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     1,
+			wantCount: 1,
+		},
+		"a Pod asking for every device of a DRA-backed extended resource takes the node": {
+			objects:   []runtime.Object{gpuSlice, gpuExtendedClass},
+			node:      gpuNode,
+			workers:   extendedPod("2"),
+			limit:     3,
+			wantCount: 1,
+		},
+		"a node advertising the extended resource is not bound by devices": {
+			objects:   []runtime.Object{gpuSlice, gpuExtendedClass},
+			node:      advertisingNode,
+			workers:   extendedPod("2"),
+			limit:     3,
+			wantCount: 3,
+		},
+		"a Pod claiming no devices is not bound by them": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass},
+			node:      gpuNode,
+			workers:   plainPod,
+			limit:     7,
+			wantCount: 7,
+		},
+		"a device another claim holds is not counted": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass, gpuClaimTemplate, allocatedClaim("gpu-pool")},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     5,
+			wantCount: 1,
+		},
+		"a device held on another node does not reduce the count": {
+			objects:   []runtime.Object{gpuSlice, otherNodeSlice, gpuDeviceClass, gpuClaimTemplate, allocatedClaim("other-pool")},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     5,
+			wantCount: 2,
+		},
+		"a pool bound to no node serves the node too": {
+			objects:   []runtime.Object{gpuSlice, sharedSlice, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     5,
+			wantCount: 3,
+		},
+		"a held device of a pool bound to no node is not counted": {
+			objects:   []runtime.Object{gpuSlice, sharedSlice, gpuDeviceClass, gpuClaimTemplate, allocatedClaim("shared-pool")},
+			node:      gpuNode,
+			workers:   claimingPod,
+			limit:     5,
+			wantCount: 2,
+		},
+		"the leader takes its devices first": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			leader:    claimingPod,
+			limit:     5,
+			wantCount: 1,
+		},
+		"a leader claiming no devices leaves the workers all of them": {
+			objects:   []runtime.Object{gpuSlice, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			leader:    plainPod,
+			limit:     5,
+			wantCount: 2,
+		},
+		"a leader taking every device leaves no room for a worker": {
+			objects:   []runtime.Object{gpuSlice, gpuExtendedClass, gpuDeviceClass, gpuClaimTemplate},
+			node:      gpuNode,
+			workers:   claimingPod,
+			leader:    extendedPod("2"),
+			limit:     5,
+			wantCount: 0,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.objects...).
+				WithIndex(&resourceapi.DeviceClass{}, indexer.DeviceClassExtendedResourceNameIndex,
+					indexer.IndexDeviceClassExtendedResourceName).
+				Build()
+			checker := NewChecker(&passthroughChecker{}, cl, &CELCache{}, true)
+			var leader *simulator.PodRequirements
+			if tc.leader != nil {
+				leader = &simulator.PodRequirements{PodTemplate: tc.leader}
+			}
+			got, err := checker.CountPodsOnNode(t.Context(), tc.node, &simulator.PodRequirements{PodTemplate: tc.workers}, leader, tc.limit)
+			if err != nil {
+				t.Fatalf("CountPodsOnNode returned error: %v", err)
+			}
+			if got != tc.wantCount {
+				t.Errorf("CountPodsOnNode() = %d, want %d", got, tc.wantCount)
+			}
+		})
+	}
+}

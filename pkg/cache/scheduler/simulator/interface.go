@@ -88,6 +88,17 @@ type SchedulerSimulator interface {
 	PreemptWorkload(ctx context.Context, wlKey client.ObjectKey) (revert func() error, err error)
 }
 
+// DevicePodCounter is implemented by a SchedulerSimulator that can tell how many Pods a
+// node's devices hold. FindFeasibleNodes answers for one Pod, so without it a node with
+// devices for one Pod looks able to take every Pod its other resources fit.
+type DevicePodCounter interface {
+	// CountPodsOnNode returns how many Pods with requirements, up to limit, the node's
+	// devices hold at once. A non-nil leader takes its devices first. A count below
+	// limit is exact; limit itself means at least that many. Pods that claim no devices
+	// on the node are not bound by them, so the count is limit.
+	CountPodsOnNode(ctx context.Context, node *corev1.Node, requirements, leader *PodRequirements, limit int32) (int32, error)
+}
+
 func AsCandidates[C Candidate](seq iter.Seq[C]) iter.Seq[Candidate] {
 	return func(yield func(Candidate) bool) {
 		for candidate := range seq {
